@@ -104,6 +104,7 @@ func (p *Project) writePackageJson() error {
 		slog.Info("adding dependency", "name", entry.Name)
 		dependencies[entry.Package] = entry.Version
 	}
+	dependencies["@pulumi/pulumi"] = global.PULUMI_VERSION
 
 	dataToWrite, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
@@ -168,7 +169,7 @@ func (p *Project) writeTypes() error {
 func (p *Project) fetchDeps() error {
 	slog.Info("fetching deps")
 	manager := global.BunPath()
-	if flag.NO_BUN {
+	if flag.SST_NO_BUN {
 		manager = "npm"
 	}
 	cmd := process.Command(manager, "install")

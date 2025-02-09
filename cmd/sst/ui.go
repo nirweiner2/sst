@@ -58,6 +58,7 @@ func CmdUI(c *cli.Cli) error {
 			aws.TaskStartEvent{},
 			aws.TaskLogEvent{},
 			aws.TaskCompleteEvent{},
+			aws.TaskMissingCommandEvent{},
 		)
 	}
 	if filter == "sst" || filter == "" {
@@ -69,6 +70,7 @@ func CmdUI(c *cli.Cli) error {
 			project.ConcurrentUpdateEvent{},
 			project.StackCommandEvent{},
 			project.BuildFailedEvent{},
+			project.SkipEvent{},
 			apitype.ResourcePreEvent{},
 			apitype.ResOpFailedEvent{},
 			apitype.ResOutputsEvent{},

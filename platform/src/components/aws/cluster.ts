@@ -8,7 +8,14 @@ import {
   output,
   secret,
 } from "@pulumi/pulumi";
-import { Component, Prettify, Transform, transform } from "../component";
+import {
+  Component,
+  ComponentVersion,
+  parseComponentVersion,
+  Prettify,
+  Transform,
+  transform,
+} from "../component";
 import { Input } from "../input";
 import { Dns } from "../dns";
 import { FunctionArgs } from "./function";
@@ -24,6 +31,7 @@ import {
   getPartitionOutput,
   getRegionOutput,
   ecr,
+  getCallerIdentityOutput,
 } from "@pulumi/aws";
 import { ImageArgs, Platform } from "@pulumi/docker-build";
 import { Cluster as ClusterV1 } from "./cluster-v1";
@@ -181,54 +189,148 @@ export type ClusterVpcsNormalizedArgs = Required<
 > &
   Omit<ClusterVpcArgs, "containerSubnets" | "serviceSubnets">;
 
-export interface ClusterArgs {
+interface ServiceRules {
   /**
-   * The VPC to use for the cluster.
+   * The port and protocol the service listens on. Uses the format `{port}/{protocol}`.
    *
    * @example
-   * Create a `Vpc` component.
-   *
-   * ```js title="sst.config.ts"
-   * const myVpc = new sst.aws.Vpc("MyVpc");
-   * ```
-   *
-   * And pass it in.
-   *
    * ```js
    * {
-   *   vpc: myVpc
-   * }
-   * ```
-   *
-   * By default, both the load balancer and the services are deployed in public subnets.
-   * The above is equivalent to:
-   *
-   * ```js
-   * {
-   *   vpc: {
-   *     id: myVpc.id,
-   *     securityGroups: myVpc.securityGroups,
-   *     containerSubnets: myVpc.publicSubnets,
-   *     loadBalancerSubnets: myVpc.publicSubnets,
-   *     cloudmapNamespaceId: myVpc.nodes.cloudmapNamespace.id,
-   *     cloudmapNamespaceName: myVpc.nodes.cloudmapNamespace.name,
-   *   }
+   *   listen: "80/http"
    * }
    * ```
    */
-  vpc: Vpc | Input<Prettify<ClusterVpcArgs>>;
-  /** @internal */
-  forceUpgrade?: "v2";
+  listen: Input<Port>;
   /**
-   * [Transform](/docs/components#transform) how this component creates its underlying
-   * resources.
+   * The port and protocol of the container the service forwards the traffic to. Uses the
+   * format `{port}/{protocol}`.
+   *
+   * @example
+   * ```js
+   * {
+   *   forward: "80/http"
+   * }
+   * ```
+   * @default The same port and protocol as `listen`.
    */
-  transform?: {
+  forward?: Input<Port>;
+  /**
+   * The name of the container to forward the traffic to. This maps to the `name` defined in the
+   * `container` prop.
+   *
+   * You only need this if there's more than one container. If there's only one container, the
+   * traffic is automatically forwarded there.
+   */
+  container?: Input<string>;
+  /**
+   * The port and protocol to redirect the traffic to. Uses the format `{port}/{protocol}`.
+   *
+   * @example
+   * ```js
+   * {
+   *   redirect: "80/http"
+   * }
+   * ```
+   */
+  redirect?: Input<Port>;
+  /**
+   * @deprecated Use `conditions.path` instead.
+   */
+  path?: Input<string>;
+  /**
+   * The conditions for the redirect. Only applicable to `http` and `https` protocols.
+   */
+  conditions?: Input<{
     /**
-     * Transform the ECS Cluster resource.
+     * Configure path-based routing. Only requests matching the path are forwarded to
+     * the container.
+     *
+     * ```js
+     * {
+     *   path: "/api/*"
+     * }
+     * ```
+     *
+     * The path pattern is case-sensitive, supports wildcards, and can be up to 128
+     * characters.
+     * - `*` matches 0 or more characters. For example, `/api/*` matches `/api/` or
+     *   `/api/orders`.
+     * - `?` matches exactly 1 character. For example, `/api/?.png` matches `/api/a.png`.
+     *
+     * @default Requests to all paths are forwarded.
      */
-    cluster?: Transform<ecs.ClusterArgs>;
-  };
+    path?: Input<string>;
+    /**
+     * Configure query string based routing. Only requests matching one of the query
+     * string conditions are forwarded to the container.
+     *
+     * Takes a list of `key`, the name of the query string parameter, and `value` pairs.
+     * Where `value` is the value of the query string parameter. But it can be a pattern as well.
+     *
+     * If multiple `key` and `value` pairs are provided, it'll match requests with **any** of the
+     * query string parameters.
+     *
+     * @example
+     *
+     * For example, to match requests with query string `version=v1`.
+     *
+     * ```js
+     * {
+     *   query: [
+     *     { key: "version", value: "v1" }
+     *   ]
+     * }
+     * ```
+     *
+     * Or match requests with query string matching `env=test*`.
+     *
+     * ```js
+     * {
+     *   query: [
+     *     { key: "env", value: "test*" }
+     *   ]
+     * }
+     * ```
+     *
+     * Match requests with query string `version=v1` **or** `env=test*`.
+     *
+     * ```js
+     * {
+     *   query: [
+     *     { key: "version", value: "v1" },
+     *     { key: "env", value: "test*" }
+     *   ]
+     * }
+     * ```
+     *
+     * Match requests with any query string key with value `example`.
+     *
+     * ```js
+     * {
+     *   query: [
+     *     { value: "example" }
+     *   ]
+     * }
+     * ```
+     *
+     * @default Query string is not checked when forwarding requests.
+     */
+    query?: Input<
+      Input<{
+        /**
+         * The name of the query string parameter.
+         */
+        key?: Input<string>;
+        /**
+         * The value of the query string parameter.
+         *
+         * If no `key` is provided, it'll match any request where a query string parameter with
+         * the given value exists.
+         */
+        value: Input<string>;
+      }>[]
+    >;
+  }>;
 }
 
 interface TaskContainerArgs {
@@ -292,6 +394,10 @@ interface TaskContainerArgs {
          * Key-value pairs of build args. Same as the top-level [`image.args`](#image-args).
          */
         args?: Input<Record<string, Input<string>>>;
+        /**
+         * The stage to build up to. Same as the top-level [`image.target`](#image-target).
+         */
+        target?: Input<string>;
       }
   >;
   /**
@@ -314,10 +420,13 @@ interface TaskContainerArgs {
    */
   logging?: Input<{
     /**
-     * The duration the logs are kept in CloudWatch. Same as the top-level
-     * [`logging.retention`](#logging-retention).
+     * The duration the logs are kept in CloudWatch. Same as the top-level [`logging.retention`](#logging-retention).
      */
     retention?: Input<keyof typeof RETENTION>;
+    /**
+     * The name of the CloudWatch log group. Same as the top-level [`logging.name`](#logging-name).
+     */
+    name?: Input<string>;
   }>;
   /**
    * Key-value pairs of AWS Systems Manager Parameter Store parameter ARNs or AWS Secrets
@@ -571,6 +680,16 @@ interface ClusterBaseArgs {
          * ```
          */
         tags?: Input<Input<string>[]>;
+        /**
+         * The stage to build up to in a [multi-stage Dockerfile](https://docs.docker.com/build/building/multi-stage/#stop-at-a-specific-build-stage).
+         * @example
+         * ```js
+         * {
+         *   target: "stage1"
+         * }
+         * ```
+         */
+        target?: Input<string>;
       }
   >;
   /**
@@ -644,6 +763,12 @@ interface ClusterBaseArgs {
      * @default `"1 month"`
      */
     retention?: Input<keyof typeof RETENTION>;
+    /**
+     * The name of the CloudWatch log group. If omitted, the log group name is generated
+     * based on the cluster name, service name, and container name.
+     * @default `"/sst/cluster/${CLUSTER_NAME}/${SERVICE_NAME}/${CONTAINER_NAME}"`
+     */
+    name?: Input<string>;
   }>;
   /**
    * Mount Amazon EFS file systems into the container.
@@ -747,6 +872,56 @@ interface ClusterBaseArgs {
   executionRole?: Input<string>;
 }
 
+export interface ClusterArgs {
+  /**
+   * The VPC to use for the cluster.
+   *
+   * @example
+   * Create a `Vpc` component.
+   *
+   * ```js title="sst.config.ts"
+   * const myVpc = new sst.aws.Vpc("MyVpc");
+   * ```
+   *
+   * And pass it in.
+   *
+   * ```js
+   * {
+   *   vpc: myVpc
+   * }
+   * ```
+   *
+   * By default, both the load balancer and the services are deployed in public subnets.
+   * The above is equivalent to:
+   *
+   * ```js
+   * {
+   *   vpc: {
+   *     id: myVpc.id,
+   *     securityGroups: myVpc.securityGroups,
+   *     containerSubnets: myVpc.publicSubnets,
+   *     loadBalancerSubnets: myVpc.publicSubnets,
+   *     cloudmapNamespaceId: myVpc.nodes.cloudmapNamespace.id,
+   *     cloudmapNamespaceName: myVpc.nodes.cloudmapNamespace.name
+   *   }
+   * }
+   * ```
+   */
+  vpc: Vpc | Input<Prettify<ClusterVpcArgs>>;
+  /** @internal */
+  forceUpgrade?: "v2";
+  /**
+   * [Transform](/docs/components#transform) how this component creates its underlying
+   * resources.
+   */
+  transform?: {
+    /**
+     * Transform the ECS Cluster resource.
+     */
+    cluster?: Transform<ecs.ClusterArgs>;
+  };
+}
+
 export interface ClusterServiceArgs extends ClusterBaseArgs {
   /**
    * Configure how this component works in `sst dev`.
@@ -804,7 +979,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
    * {
    *   public: {
    *     domain: "example.com",
-   *     ports: [
+   *     rules: [
    *       { listen: "80/http" },
    *       { listen: "443/https", forward: "80/http" }
    *     ]
@@ -963,6 +1138,8 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
           dns?: Input<false | (Dns & {})>;
         }
     >;
+    /** @deprecated Use `rules` instead. */
+    ports?: Input<Prettify<ServiceRules>[]>;
     /**
      * Configure the mapping for the ports the public endpoint listens to and forwards to
      * the service.
@@ -983,7 +1160,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * ```js
      * {
      *   public: {
-     *     ports: [
+     *     rules: [
      *       { listen: "80/http", forward: "8080/http" }
      *     ]
      *   }
@@ -996,7 +1173,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * ```js
      * {
      *   public: {
-     *     ports: [
+     *     rules: [
      *       { listen: "80/http" }
      *     ]
      *   }
@@ -1009,7 +1186,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * ```js
      * {
      *   public: {
-     *     ports: [
+     *     rules: [
      *       { listen: "80/http", container: "app" },
      *       { listen: "8000/http", container: "admin" },
      *     ]
@@ -1017,42 +1194,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * }
      * ```
      */
-    ports: Input<
-      {
-        /**
-         * The port and protocol the service listens on. Uses the format `{port}/{protocol}`.
-         */
-        listen: Input<Port>;
-        /**
-         * The port and protocol of the container the service forwards the traffic to. Uses the
-         * format `{port}/{protocol}`.
-         * @default The same port and protocol as `listen`.
-         */
-        forward?: Input<Port>;
-        /**
-         * Configure path-based routing. Only requests matching the path are forwarded to
-         * the container. Only applicable to "http" protocols.
-         *
-         * @default Requests to all paths are forwarded.
-         */
-        path?: Input<string>;
-        /**
-         * The name of the container to forward the traffic to.
-         *
-         * If there is only one container, this is not needed. The traffic is automatically
-         * forwarded to the container.
-         *
-         * If there is more than one container, this is required.
-         *
-         * @default The container name when there is only one container.
-         */
-        container?: Input<string>;
-        /**
-         * The port and protocol to redirect the traffic to. Uses the format `{port}/{protocol}`.
-         */
-        redirect?: Input<Port>;
-      }[]
-    >;
+    rules?: Input<Prettify<ServiceRules>[]>;
   }>;
   /**
    * Configure a load balancer to route traffic to the containers.
@@ -1074,7 +1216,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
    * {
    *   loadBalancer: {
    *     domain: "example.com",
-   *     ports: [
+   *     rules: [
    *       { listen: "80/http", redirect: "443/https" },
    *       { listen: "443/https", forward: "80/http" }
    *     ]
@@ -1252,6 +1394,8 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
           dns?: Input<false | (Dns & {})>;
         }
     >;
+    /** @deprecated Use `rules` instead. */
+    ports?: Input<Prettify<ServiceRules>[]>;
     /**
      * Configure the mapping for the ports the load balancer listens to, forwards, or redirects to
      * the service.
@@ -1272,7 +1416,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * Here we are listening on port `80` and forwarding it to the service on port `8080`.
      * ```js
      * {
-     *   ports: [
+     *   rules: [
      *     { listen: "80/http", forward: "8080/http" }
      *   ]
      * }
@@ -1283,7 +1427,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      *
      * ```js
      * {
-     *   ports: [
+     *   rules: [
      *     { listen: "80/http" }
      *   ]
      * }
@@ -1294,7 +1438,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      *
      * ```js
      * {
-     *   ports: [
+     *   rules: [
      *     { listen: "80/http", container: "app" },
      *     { listen: "8000/http", container: "admin" }
      *   ]
@@ -1305,9 +1449,17 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      *
      * ```js
      * {
-     *   ports: [
-     *     { listen: "80/http", container: "app", path: "/api/*" },
-     *     { listen: "80/http", container: "admin", path: "/admin/*" }
+     *   rules: [
+     *     {
+     *       listen: "80/http",
+     *       container: "app",
+     *       conditions: { path: "/api/*" }
+     *     },
+     *     {
+     *       listen: "80/http",
+     *       container: "admin",
+     *       conditions: { path: "/admin/*" }
+     *     }
      *   ]
      * }
      * ```
@@ -1317,56 +1469,14 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      *
      * ```js
      * {
-     *   ports: [
+     *   rules: [
      *     { listen: "80/http", redirect: "443/https" },
      *     { listen: "443/https", forward: "80/http" }
      *   ]
      * }
      * ```
      */
-    ports: Input<
-      {
-        /**
-         * The port and protocol the service listens on. Uses the format `{port}/{protocol}`.
-         */
-        listen: Input<Port>;
-        /**
-         * The port and protocol of the container the service forwards the traffic to. Uses the
-         * format `{port}/{protocol}`.
-         * @default The same port and protocol as `listen`.
-         */
-        forward?: Input<Port>;
-        /**
-         * Configure path-based routing. Only requests matching the path are forwarded to
-         * the container. Only applicable to "http" protocols.
-         *
-         * The path pattern is case-sensitive, supports wildcards, and can be up to 128
-         * characters.
-         * - `*` matches 0 or more characters.
-         * - `?` matches exactly 1 character.
-         *
-         * For example:
-         * - `/api/*`
-         * - `/api/*.png
-         *
-         * @default Requests to all paths are forwarded.
-         */
-        path?: Input<string>;
-        /**
-         * The name of the container to forward the traffic to.
-         *
-         * You need this if there's more than one container.
-         *
-         * If there is only one container, the traffic is automatically forwarded to that
-         * container.
-         */
-        container?: Input<string>;
-        /**
-         * The port and protocol to redirect the traffic to. Uses the format `{port}/{protocol}`.
-         */
-        redirect?: Input<Port>;
-      }[]
-    >;
+    rules?: Input<Prettify<ServiceRules>[]>;
     /**
      * Configure the health check that the load balancer runs on your containers.
      *
@@ -1438,7 +1548,7 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      *
      * ```js
      * {
-     *   ports: [
+     *   rules: [
      *     { listen: "80/http", forward: "8080/http" }
      *   ],
      *   health: {
@@ -1599,7 +1709,164 @@ export interface ClusterServiceArgs extends ClusterBaseArgs {
      * ```
      */
     memoryUtilization?: Input<false | number>;
+    /**
+     * The target request count to scale up or down. It'll scale up when the request count is
+     * above the target and scale down when it's below the target.
+     * @default `false`
+     * @example
+     * ```js
+     * {
+     *   scaling: {
+     *     requestCount: 1500
+     *   }
+     * }
+     * ```
+     */
+    requestCount?: Input<false | number>;
   }>;
+  /**
+   * Configure the capacity provider; regular Fargate or Fargate Spot, for this service.
+   *
+   * :::tip
+   * Fargate Spot is a good option for dev or PR environments.
+   * :::
+   *
+   * Fargate Spot allows you to run containers on spare AWS capacity at around 50% discount
+   * compared to regular Fargate. [Learn more about Fargate
+   * pricing](https://aws.amazon.com/fargate/pricing/).
+   *
+   * :::note
+   * AWS might shut down Fargate Spot instances to reclaim capacity.
+   * :::
+   *
+   * There are a couple of caveats:
+   *
+   * 1. AWS may reclaim this capacity and **turn off your service** after a two-minute warning.
+   *    This is rare, but it can happen.
+   * 2. If there's no spare capacity, you'll **get an error**.
+   *
+   * This makes Fargate Spot a good option for dev or PR environments. You can set this using.
+   *
+   * ```js
+   * {
+   *   capacity: "spot"
+   * }
+   * ```
+   *
+   * You can also configure the % of regular vs spot capacity you want through the `weight` prop.
+   * And optionally set the `base` or first X number of tasks that'll be started using a given
+   * capacity.
+   *
+   * For example, the `base: 1` says that the first task uses regular Fargate, and from that
+   * point on there will be an even split between the capacity providers.
+   *
+   * ```js
+   * {
+   *   capacity: {
+   *     fargate: { weight: 1, base: 1 },
+   *     spot: { weight: 1 }
+   *   }
+   * }
+   * ```
+   *
+   * The `base` works in tandem with the `scaling` prop. So setting `base` to X doesn't mean
+   * it'll start those tasks right away. It means that as your service scales up, according to
+   * the `scaling` prop, it'll ensure that the first X tasks will be with the given capacity.
+   *
+   * :::caution
+   * Changing `capacity` requires taking down and recreating the ECS service.
+   * :::
+   *
+   * And this is why you can only set the `base` for only one capacity provider. So you
+   * are not allowed to do the following.
+   *
+   * ```js
+   * {
+   *   capacity: {
+   *     fargate: { weight: 1, base: 1 },
+   *     // This will give you an error
+   *     spot: { weight: 1, base: 1 }
+   *   }
+   * }
+   * ```
+   *
+   * When you change the `capacity`, the ECS service is terminated and recreated. This will
+   * cause some temporary downtime.
+   *
+   * @default Regular Fargate
+   *
+   * @example
+   *
+   * Here are some examples settings.
+   *
+   * - Use only Fargate Spot.
+   *
+   *   ```js
+   *   {
+   *     capacity: "spot"
+   *   }
+   *   ```
+   * - Use 50% regular Fargate and 50% Fargate Spot.
+   *
+   *   ```js
+   *   {
+   *     capacity: {
+   *       fargate: { weight: 1 },
+   *       spot: { weight: 1 }
+   *     }
+   *   }
+   *   ```
+   * - Use 50% regular Fargate and 50% Fargate Spot. And ensure that the first 2 tasks use
+   *   regular Fargate.
+   *
+   *   ```js
+   *   {
+   *     capacity: {
+   *       fargate: { weight: 1, base: 2 },
+   *       spot: { weight: 1 }
+   *     }
+   *   }
+   *   ```
+   */
+  capacity?: Input<
+    | "spot"
+    | {
+        /**
+         * Configure how the regular Fargate capacity is allocated.
+         */
+        fargate?: Input<{
+          /**
+           * Start the first `base` number of tasks with the given capacity.
+           *
+           * :::caution
+           * You can only specify `base` for one capacity provider.
+           * :::
+           */
+          base?: Input<number>;
+          /**
+           * Ensure the given ratio of tasks are started for this capacity.
+           */
+          weight: Input<number>;
+        }>;
+        /**
+         * Configure how the Fargate spot capacity is allocated.
+         */
+        spot?: Input<{
+          /**
+           * Start the first `base` number of tasks with the given capacity.
+           *
+           * :::caution
+           * You can only specify `base` for one capacity provider.
+           * :::
+           */
+          base?: Input<number>;
+          /**
+           * Ensure the given ratio of tasks are started for this capacity.
+           */
+          weight: Input<number>;
+        }>;
+      }
+  >;
   /**
    * Configure the health check that ECS runs on your containers.
    *
@@ -1898,6 +2165,23 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
   };
 }
 
+export interface ClusterGetArgs {
+  /**
+   * The ID of the cluster.
+   */
+  id: Input<string>;
+  /**
+   * The VPC used for the cluster.
+   */
+  vpc: ClusterArgs["vpc"];
+}
+
+interface ClusterRef {
+  ref: true;
+  id: Input<string>;
+  vpc: ClusterArgs["vpc"];
+}
+
 /**
  * The `Cluster` component lets you create a cluster of containers to your app. It uses
  * [Amazon ECS](https://aws.amazon.com/ecs/) on [AWS Fargate](https://aws.amazon.com/fargate/).
@@ -1925,7 +2209,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  * Add a service to your cluster.
  *
  * ```ts title="sst.config.ts"
- * cluster.addService("MyService");
+ * const service = cluster.addService("MyService");
  * ```
  *
  * #### Configure the container image
@@ -1950,7 +2234,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  *     min: 4,
  *     max: 16,
  *     cpuUtilization: 50,
- *     memoryUtilization: 50,
+ *     memoryUtilization: 50
  *   }
  * });
  * ```
@@ -1963,8 +2247,8 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  * ```ts title="sst.config.ts"
  * const service = cluster.addService("MyService", {
  *   serviceRegistry: {
- *     port: 80,
- *   },
+ *     port: 80
+ *   }
  * });
  *
  * const api = new sst.aws.ApiGatewayV2("MyApi", {
@@ -1983,9 +2267,9 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  * cluster.addService("MyService", {
  *   loadBalancer: {
  *     domain: "example.com",
- *     ports: [
+ *     rules: [
  *       { listen: "80/http" },
- *       { listen: "443/https", forward: "80/http" },
+ *       { listen: "443/https", forward: "80/http" }
  *     ]
  *   }
  * });
@@ -2000,7 +2284,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  * const bucket = new sst.aws.Bucket("MyBucket");
  *
  * cluster.addService("MyService", {
- *   link: [bucket],
+ *   link: [bucket]
  * });
  * ```
  *
@@ -2011,6 +2295,32 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  *
  * console.log(Resource.MyBucket.name);
  * ```
+ *
+ * #### Service discovery
+ *
+ * This component automatically creates a Cloud Map service host name for the service. So
+ * anything in the same VPC can access it using the service's host name.
+ *
+ * For example, if you link the service to a Lambda function that's in the same VPC.
+ *
+ * ```ts title="sst.config.ts" {2,4}
+ * new sst.aws.Function("MyFunction", {
+ *   vpc,
+ *   url: true,
+ *   link: [service],
+ *   handler: "lambda.handler"
+ * });
+ * ```
+ *
+ * You can access the service by its host name using the [SDK](/docs/reference/sdk/).
+ *
+ * ```ts title="lambda.ts"
+ * import { Resource } from "sst";
+ *
+ * await fetch(`http://${Resource.MyService.service}`);
+ * ```
+ *
+ * [Check out an example](/docs/examples/#aws-cluster-service-discovery).
  *
  * ---
  *
@@ -2094,7 +2404,10 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  * container also gets a public IPv4 address at $0.005 per hour.
  *
  * For a service, works out to $0.04048 x 0.25 x 24 x 30 + $0.004445 x 0.5 x 24 x 30 + $0.005
- * x 24 x 30 or **$13 per month**.
+ * x 24 x 30 or **$12 per month**.
+ *
+ * If you are using all Fargate Spot instances with `capacity: "spot"`, it's $0.01218784 x 0.25
+ * x 24 x 30 + $0.00133831 x 0.5 x 24 x 30 + $0.005 x 24 x 30 or **$6 per month**
  *
  * For a task, it works out to $0.04048 x 0.25 + $0.004445 x 0.5 + $0.005. Or **$0.02 per hour**
  * your task runs for.
@@ -2124,7 +2437,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  *
  * #### Application Load Balancer
  *
- * If you add `loadBalancer` _HTTP_ or _HTTPS_ `ports`, an ALB is created at $0.0225 per hour,
+ * If you add `loadBalancer` _HTTP_ or _HTTPS_ `rules`, an ALB is created at $0.0225 per hour,
  * $0.008 per LCU-hour, and $0.005 per hour if HTTPS with a custom domain is used. Where LCU
  * is a measure of how much traffic is processed.
  *
@@ -2137,7 +2450,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  *
  * #### Network Load Balancer
  *
- * If you add `loadBalancer` _TCP_, _UDP_, or _TLS_ `ports`, an NLB is created at $0.0225 per hour and
+ * If you add `loadBalancer` _TCP_, _UDP_, or _TLS_ `rules`, an NLB is created at $0.0225 per hour and
  * $0.006 per NLCU-hour. Where NCLU is a measure of how much traffic is processed.
  *
  * That works out to $0.0225 x 24 x 30 or **$16 per month**. Also add the NLCU-hour used.
@@ -2148,7 +2461,7 @@ export interface ClusterTaskArgs extends ClusterBaseArgs {
  */
 export class Cluster extends Component {
   private constructorOpts: ComponentResourceOptions;
-  private cluster: ecs.Cluster;
+  private cluster: Output<ecs.Cluster>;
   private vpc: Vpc | Output<Prettify<ClusterVpcsNormalizedArgs>>;
   public static v1 = ClusterV1;
 
@@ -2158,34 +2471,52 @@ export class Cluster extends Component {
     opts: ComponentResourceOptions = {},
   ) {
     super(__pulumiType, name, args, opts);
-    const _version = 2;
+    const _version = { major: 2, minor: 0 };
     const self = this;
+    this.constructorOpts = opts;
 
-    self.registerVersion({
-      new: _version,
-      old: $cli.state.version[name],
-      message: [
-        `There is a new version of "Cluster" that has breaking changes.`,
-        ``,
-        `What changed:`,
-        `  - In the old version, load balancers were deployed in public subnets, and services were deployed in private subnets. The VPC was required to have NAT gateways.`,
-        `  - In the latest version, both the load balancer and the services are deployed in public subnets. The VPC is not required to have NAT gateways. So the new default makes this cheaper to run.`,
-        ``,
-        `To upgrade:`,
-        `  - Set \`forceUpgrade: "v${_version}"\` on the "Cluster" component. Learn more https://sst.dev/docs/component/aws/cluster#forceupgrade`,
-        ``,
-        `To continue using v${$cli.state.version[name]}:`,
-        `  - Rename "Cluster" to "Cluster.v${$cli.state.version[name]}". Learn more about versioning - https://sst.dev/docs/components/#versioning`,
-      ].join("\n"),
-      forceUpgrade: args.forceUpgrade,
-    });
+    if (args && "ref" in args) {
+      const ref = reference();
+      const vpc = normalizeVpc();
+      this.cluster = ref.cluster;
+      this.vpc = vpc;
+      return;
+    }
 
+    registerVersion();
     const vpc = normalizeVpc();
     const cluster = createCluster();
+    createCapacityProviders();
 
-    this.constructorOpts = opts;
-    this.cluster = cluster;
+    this.cluster = output(cluster);
     this.vpc = vpc;
+
+    function reference() {
+      const ref = args as ClusterRef;
+      const cluster = ecs.Cluster.get(`${name}Cluster`, ref.id, undefined, {
+        parent: self,
+      });
+      const clusterValidated = cluster.tags.apply((tags) => {
+        const refVersion = tags?.["sst:ref:version"]
+          ? parseComponentVersion(tags["sst:ref:version"])
+          : undefined;
+
+        if (refVersion?.minor !== _version.minor) {
+          throw new VisibleError(
+            [
+              `There have been some minor changes to the "Cluster" component that's being referenced by "${name}".\n`,
+              `To update, you'll need to redeploy the stage where the cluster was created. And then redeploy this stage.`,
+            ].join("\n"),
+          );
+        }
+
+        registerVersion(refVersion);
+
+        return cluster;
+      });
+
+      return { cluster: clusterValidated };
+    }
 
     function normalizeVpc() {
       // "vpc" is a Vpc.v1 component
@@ -2224,11 +2555,57 @@ export class Cluster extends Component {
         ...transform(
           args.transform?.cluster,
           `${name}Cluster`,
-          {},
+          {
+            tags: {
+              "sst:ref:version": `${_version.major}.${_version.minor}`,
+            },
+          },
           { parent: self },
         ),
       );
     }
+
+    function registerVersion(overrideVersion?: ComponentVersion) {
+      const newMajorVersion = _version.major;
+      const oldMajorVersion =
+        overrideVersion?.major ?? $cli.state.version[name];
+      self.registerVersion({
+        new: newMajorVersion,
+        old: oldMajorVersion,
+        message: [
+          `There is a new version of "Cluster" that has breaking changes.`,
+          ``,
+          `What changed:`,
+          `  - In the old version, load balancers were deployed in public subnets, and services were deployed in private subnets. The VPC was required to have NAT gateways.`,
+          `  - In the latest version, both the load balancer and the services are deployed in public subnets. The VPC is not required to have NAT gateways. So the new default makes this cheaper to run.`,
+          ``,
+          `To upgrade:`,
+          `  - Set \`forceUpgrade: "v${newMajorVersion}"\` on the "Cluster" component. Learn more https://sst.dev/docs/component/aws/cluster#forceupgrade`,
+          ``,
+          `To continue using v${$cli.state.version[name]}:`,
+          `  - Rename "Cluster" to "Cluster.v${$cli.state.version[name]}". Learn more about versioning - https://sst.dev/docs/components/#versioning`,
+        ].join("\n"),
+        forceUpgrade: args.forceUpgrade,
+      });
+    }
+
+    function createCapacityProviders() {
+      return new ecs.ClusterCapacityProviders(
+        `${name}CapacityProviders`,
+        {
+          clusterName: cluster.name,
+          capacityProviders: ["FARGATE", "FARGATE_SPOT"],
+        },
+        { parent: self },
+      );
+    }
+  }
+
+  /**
+   * The cluster ID.
+   */
+  public get id() {
+    return this.cluster.id;
   }
 
   /**
@@ -2247,7 +2624,8 @@ export class Cluster extends Component {
    * Add a service to the cluster.
    *
    * @param name Name of the service.
-   * @param args Configure the service.
+   * @param args? Configure the service.
+   * @param opts? Resource options.
    *
    * @example
    *
@@ -2299,7 +2677,11 @@ export class Cluster extends Component {
    *
    * This is useful for running sidecar containers.
    */
-  public addService(name: string, args?: ClusterServiceArgs) {
+  public addService(
+    name: string,
+    args?: ClusterServiceArgs,
+    opts?: ComponentResourceOptions,
+  ) {
     // Do not prefix the service to allow `Resource.MyService` to work.
     return new Service(
       name,
@@ -2308,7 +2690,7 @@ export class Cluster extends Component {
         vpc: this.vpc,
         ...args,
       },
-      { provider: this.constructorOpts.provider },
+      { provider: this.constructorOpts.provider, ...opts },
     );
   }
 
@@ -2316,7 +2698,8 @@ export class Cluster extends Component {
    * Add a task to the cluster.
    *
    * @param name Name of the task.
-   * @param args Configure the task.
+   * @param args? Configure the task.
+   * @param opts? Resource options.
    *
    * @example
    *
@@ -2348,7 +2731,11 @@ export class Cluster extends Component {
    *
    * This is useful for running sidecar containers.
    */
-  public addTask(name: string, args?: ClusterTaskArgs) {
+  public addTask(
+    name: string,
+    args?: ClusterTaskArgs,
+    opts?: ComponentResourceOptions,
+  ) {
     // Do not prefix the task to allow `Resource.MyTask` to work.
     return new Task(
       name,
@@ -2357,15 +2744,65 @@ export class Cluster extends Component {
         vpc: this.vpc,
         ...args,
       },
-      { provider: this.constructorOpts.provider },
+      { provider: this.constructorOpts.provider, ...opts },
+    );
+  }
+
+  /**
+   * Reference an existing ECS Cluster with the given ID. This is useful when you
+   * create a cluster in one stage and want to share it in another. It avoids
+   * having to create a new cluster in the other stage.
+   *
+   * :::tip
+   * You can use the `static get` method to share cluster across stages.
+   * :::
+   *
+   * @param name The name of the component.
+   * @param args The arguments to get the cluster.
+   * @param opts? Resource options.
+   *
+   * @example
+   * Imagine you create a cluster in the `dev` stage. And in your personal stage `frank`,
+   * instead of creating a new cluster, you want to share the same cluster from `dev`.
+   *
+   * ```ts title="sst.config.ts"
+   * const cluster = $app.stage === "frank"
+   *   ? sst.aws.Cluster.get("MyCluster", {
+   *       id: "arn:aws:ecs:us-east-1:123456789012:cluster/app-dev-MyCluster",
+   *       vpc,
+   *     })
+   *   : new sst.aws.Cluster("MyCluster", { vpc });
+   * ```
+   *
+   * Here `arn:aws:ecs:us-east-1:123456789012:cluster/app-dev-MyCluster` is the ID of the
+   * cluster created in the `dev` stage. You can find these by outputting the cluster ID
+   * in the `dev` stage.
+   *
+   * ```ts title="sst.config.ts"
+   * return {
+   *   id: cluster.id,
+   * };
+   * ```
+   */
+  public static get(
+    name: string,
+    args: ClusterGetArgs,
+    opts?: ComponentResourceOptions,
+  ) {
+    return new Cluster(
+      name,
+      { ref: true, id: args.id, vpc: args.vpc } as ClusterArgs,
+      opts,
     );
   }
 }
 
+/** @internal */
 export function normalizeArchitecture(args: ClusterTaskArgs) {
   return output(args.architecture ?? "x86_64").apply((v) => v);
 }
 
+/** @internal */
 export function normalizeCpu(args: ClusterTaskArgs) {
   return output(args.cpu ?? "0.25 vCPU").apply((v) => {
     if (!supportedCpus[v]) {
@@ -2379,6 +2816,7 @@ export function normalizeCpu(args: ClusterTaskArgs) {
   });
 }
 
+/** @internal */
 export function normalizeMemory(
   cpu: ReturnType<typeof normalizeCpu>,
   args: ClusterTaskArgs,
@@ -2395,6 +2833,7 @@ export function normalizeMemory(
   });
 }
 
+/** @internal */
 export function normalizeStorage(args: ClusterTaskArgs) {
   return output(args.storage ?? "20 GB").apply((v) => {
     const storage = toGBs(v);
@@ -2406,9 +2845,10 @@ export function normalizeStorage(args: ClusterTaskArgs) {
   });
 }
 
+/** @internal */
 export function normalizeContainers(
   type: "service" | "task",
-  args: ClusterServiceArgs,
+  args: ServiceArgs,
   name: string,
   architecture: ReturnType<typeof normalizeArchitecture>,
 ) {
@@ -2488,20 +2928,26 @@ export function normalizeContainers(
       }
 
       function normalizeLogging() {
-        return output(v.logging).apply((logging) => ({
-          ...logging,
-          retention: logging?.retention ?? "1 month",
-        }));
+        return all([v.logging, args.cluster.nodes.cluster.name]).apply(
+          ([logging, clusterName]) => ({
+            ...logging,
+            retention: logging?.retention ?? "1 month",
+            name:
+              logging?.name ?? `/sst/cluster/${clusterName}/${name}/${v.name}`,
+          }),
+        );
       }
     }),
   );
 }
 
+/** @internal */
 export function createTaskRole(
   name: string,
   args: ClusterTaskArgs,
   opts: ComponentResourceOptions,
   parent: Component,
+  dev: boolean,
   additionalPermissions?: FunctionArgs["permissions"],
 ) {
   if (args.taskRole)
@@ -2515,10 +2961,7 @@ export function createTaskRole(
     iam.getPolicyDocumentOutput({
       statements: [
         ...argsPermissions,
-        ...linkPermissions.map((item) => ({
-          actions: item.actions,
-          resources: item.resources,
-        })),
+        ...linkPermissions,
         ...(additionalPermissions ?? []),
         {
           actions: [
@@ -2529,7 +2972,14 @@ export function createTaskRole(
           ],
           resources: ["*"],
         },
-      ],
+      ].map((item) => ({
+        effect: (() => {
+          const effect = item.effect ?? "allow";
+          return effect.charAt(0).toUpperCase() + effect.slice(1);
+        })(),
+        actions: item.actions,
+        resources: item.resources,
+      })),
     }),
   );
 
@@ -2540,6 +2990,7 @@ export function createTaskRole(
       {
         assumeRolePolicy: iam.assumeRolePolicyForPrincipal({
           Service: "ecs-tasks.amazonaws.com",
+          ...(dev ? { AWS: getCallerIdentityOutput({}, opts).accountId } : {}),
         }),
         inlinePolicies: policy.apply(({ statements }) =>
           statements ? [{ name: "inline", policy: policy.json }] : [],
@@ -2550,6 +3001,7 @@ export function createTaskRole(
   );
 }
 
+/** @internal */
 export function createExecutionRole(
   name: string,
   args: ClusterTaskArgs,
@@ -2564,7 +3016,6 @@ export function createExecutionRole(
       { parent },
     );
 
-  const partition = getPartitionOutput({}, opts).partition;
   return new iam.Role(
     ...transform(
       args.transform?.executionRole,
@@ -2574,7 +3025,9 @@ export function createExecutionRole(
           Service: "ecs-tasks.amazonaws.com",
         }),
         managedPolicyArns: [
-          interpolate`arn:${partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy`,
+          interpolate`arn:${
+            getPartitionOutput({}, opts).partition
+          }:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy`,
         ],
         inlinePolicies: [
           {
@@ -2601,6 +3054,7 @@ export function createExecutionRole(
   );
 }
 
+/** @internal */
 export function createTaskDefinition(
   name: string,
   args: ServiceArgs,
@@ -2660,6 +3114,7 @@ export function createTaskDefinition(
                 ...container.image.args,
                 ...linkEnvs,
               },
+              target: container.image.target,
               platforms: [container.image.platform],
               tags: [container.name, ...(container.image.tags ?? [])].map(
                 (tag) => interpolate`${bootstrapData.assetEcrUrl}:${tag}`,
@@ -2725,7 +3180,7 @@ export function createTaskDefinition(
                 args.transform?.logGroup,
                 `${name}LogGroup${container.name}`,
                 {
-                  name: interpolate`/sst/cluster/${clusterName}/${name}/${container.name}`,
+                  name: container.logging.name,
                   retentionInDays: RETENTION[container.logging.retention],
                 },
                 { parent },

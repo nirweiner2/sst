@@ -1,4 +1,4 @@
-import { ComponentResourceOptions, output, Output } from "@pulumi/pulumi";
+import { all, ComponentResourceOptions, output, Output } from "@pulumi/pulumi";
 import { Component, Transform, transform } from "../component";
 import { FunctionArgs, FunctionArn } from "./function";
 import { Input } from "../input.js";
@@ -95,6 +95,35 @@ export interface CronArgs {
    */
   task?: Task;
   /**
+   * The event that'll be passed to the function or task.
+   *
+   * @example
+   * ```ts
+   * {
+   *   event: {
+   *     foo: "bar",
+   *   }
+   * }
+   * ```
+   *
+   * For Lambda functions, the event will be passed to the function as an event.
+   *
+   * ```ts
+   * function handler(event) {
+   *   console.log(event.foo);
+   * }
+   * ```
+   *
+   * For ECS Fargate tasks, the event will be passed to the task as the `SST_EVENT`
+   * environment variable.
+   *
+   * ```ts
+   * const event = JSON.parse(process.env.SST_EVENT);
+   * console.log(event.foo);
+   * ```
+   */
+  event?: Input<Record<string, Input<string>>>;
+  /**
    * The schedule for the cron job.
    *
    * :::note
@@ -125,6 +154,17 @@ export interface CronArgs {
    * ```
    */
   schedule: Input<`rate(${string})` | `cron(${string})`>;
+  /**
+   * Configures whether the cron job is enabled. When disabled, the cron job won't run.
+   * @default true
+   * @example
+   * ```ts
+   * {
+   *   enabled: false
+   * }
+   * ```
+   */
+  enabled?: Input<boolean>;
   /**
    * [Transform](/docs/components#transform) how this component creates its underlying resources.
    */
@@ -194,7 +234,9 @@ export class Cron extends Component {
     const parent = this;
 
     const fnArgs = normalizeFunction();
+    const event = output(args.event || {});
     normalizeTargets();
+    const enabled = output(args.enabled ?? true);
     const rule = createRule();
     const fn = createFunction();
     const role = createRole();
@@ -229,6 +271,7 @@ export class Cron extends Component {
           `${name}Rule`,
           {
             scheduleExpression: args.schedule,
+            state: enabled.apply((v) => (v ? "ENABLED" : "DISABLED")),
           },
           { parent },
         ),
@@ -298,21 +341,40 @@ export class Cron extends Component {
           args.transform?.target,
           `${name}Target`,
           fn
-            ? { arn: fn.arn, rule: rule.name }
+            ? {
+                arn: fn.arn,
+                rule: rule.name,
+                input: event.apply((event) => JSON.stringify(event)),
+              }
             : {
-              arn: args.task!.cluster,
-              rule: rule.name,
-              ecsTarget: {
-                launchType: "FARGATE",
-                taskDefinitionArn: args.task!.nodes.taskDefinition.arn,
-                networkConfiguration: {
-                  subnets: args.task!.subnets,
-                  securityGroups: args.task!.securityGroups,
-                  assignPublicIp: args.task!.assignPublicIp,
+                arn: args.task!.cluster,
+                rule: rule.name,
+                ecsTarget: {
+                  launchType: "FARGATE",
+                  taskDefinitionArn: args.task!.nodes.taskDefinition.arn,
+                  networkConfiguration: {
+                    subnets: args.task!.subnets,
+                    securityGroups: args.task!.securityGroups,
+                    assignPublicIp: args.task!.assignPublicIp,
+                  },
                 },
+                roleArn: role!.arn,
+                input: all([event, args.task!.containers]).apply(
+                  ([event, containers]) => {
+                    return JSON.stringify({
+                      containerOverrides: containers.map((name) => ({
+                        name,
+                        environment: [
+                          {
+                            name: "SST_EVENT",
+                            value: JSON.stringify(event),
+                          },
+                        ],
+                      })),
+                    });
+                  },
+                ),
               },
-              roleArn: role!.arn,
-            },
           { parent },
         ),
       );

@@ -1,9 +1,8 @@
-import { ComponentResourceOptions, Output, all, output } from "@pulumi/pulumi";
+import { ComponentResourceOptions, Output, output } from "@pulumi/pulumi";
 import { Component, Transform, transform } from "../component";
 import { Link } from "../link";
 import type { Input } from "../input";
 import { FunctionArgs, FunctionArn } from "./function";
-import { physicalName } from "../naming";
 import { parseEventBusArn } from "./helpers/arn";
 import { BusLambdaSubscriber } from "./bus-lambda-subscriber";
 import { cloudwatch } from "@pulumi/aws";
@@ -44,7 +43,7 @@ export interface BusSubscriberArgs {
    *   detail: {
    *      price_usd: 210.75
    *   },
-   *   "detail-type": "orderPlaced",
+   *   "detail-type": "orderPlaced"
    * }
    * ```
    *
@@ -53,50 +52,54 @@ export interface BusSubscriberArgs {
    * ```js
    * {
    *   pattern: {
-   *     source: ["my.source", "my.source2"],
+   *     source: ["my.source", "my.source2"]
    *   }
    * }
    * ```
    */
   pattern?: Input<{
     /**
-     * A list of "source" values to match against. "source" indicates where the event
-     * originated.
+     * A list of `source` values to match against. The `source` indicates where the
+     * event originated.
      *
      * @example
+     *
      * ```js
      * {
      *   pattern: {
-     *     source: "my.source"
-     *   },
+     *     source: ["my.source", "my.source2"]
+     *   }
      * }
      * ```
      */
     source?: (string | any)[];
     /**
-     * A JSON object of "detail" values to match against. "detail" contains the actual
-     * data or information associated with the event.
+     * An object of `detail` values to match against, where the key is the name and
+     * the value is the pattern to match. The `detail` contains the actual
+     * data associated with the event.
      *
      * @example
      * ```js
      * {
      *   pattern: {
-     *     price_usd: [{numeric: [">=", 100]}]
-     *   },
+     *     detail: {
+     *       price_usd: [{numeric: [">=", 100]}]
+     *     }
+     *   }
      * }
      * ```
      */
-    detail?: { [key: string]: any };
+    detail?: Record<string, any>;
     /**
-     * A list of "detail-type" values to match against. "detail-type" typically defines
-     * the kind of event that is occurring.
+     * A list of `detail-type` values to match against. The `detail-type` typically
+     * defines the kind of event that is emitted.
      *
      * @example
      * ```js
      * {
      *   pattern: {
      *     detailType: ["orderPlaced"]
-     *   },
+     *   }
      * }
      * ```
      */
@@ -132,7 +135,16 @@ export interface BusSubscriberArgs {
  * #### Add a subscriber
  *
  * ```ts
- * bus.subscribe("src/subscriber.handler");
+ * bus.subscribe("MySubscriber", "src/subscriber.handler");
+ * ```
+ *
+ * #### Customize the subscriber
+ *
+ * ```ts
+ * bus.subscribe("MySubscriber", {
+ *   handler: "src/subscriber.handler",
+ *   timeout: "60 seconds"
+ * });
  * ```
  *
  * #### Link the bus to a resource
@@ -145,9 +157,9 @@ export interface BusSubscriberArgs {
  * });
  * ```
  *
- * Once linked, you can publish messages to the bus from your function code.
+ * Once linked, you can publish messages to the bus from your app.
  *
- * ```ts title="app/page.tsx" {1,7}
+ * ```ts title="app/page.tsx" {1,9}
  * import { Resource } from "sst";
  * import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
  *
@@ -158,9 +170,9 @@ export interface BusSubscriberArgs {
  *     {
  *       EventBusName: Resource.MyBus.name,
  *       Source: "my.source",
- *       Detail: JSON.stringify({ foo: "bar" }),
+ *       Detail: JSON.stringify({ foo: "bar" })
  *     }
- *   ],
+ *   ]
  * }));
  * ```
  */
@@ -186,16 +198,16 @@ export class Bus extends Component implements Link.Linkable {
 
     function createBus() {
       return new cloudwatch.EventBus(
-        ...transform(
-          args.transform?.bus,
-          `${name}Bus`,
-          {
-            name: physicalName(256, name),
-          },
-          { parent },
-        ),
+        ...transform(args.transform?.bus, `${name}Bus`, {}, { parent }),
       );
     }
+  }
+
+  /**
+   * The ARN of the EventBus.
+   */
+  public get arn() {
+    return this.bus.arn;
   }
 
   /**
@@ -218,7 +230,7 @@ export class Bus extends Component implements Link.Linkable {
   }
 
   /**
-   * Subscribe to this EventBus.
+   * Subscribe to this EventBus with a function.
    *
    * @param name The name of the subscription.
    * @param subscriber The function that'll be notified.
@@ -226,11 +238,11 @@ export class Bus extends Component implements Link.Linkable {
    *
    * @example
    *
-   * ```js
+   * ```js title="sst.config.ts"
    * bus.subscribe("MySubscription", "src/subscriber.handler");
    * ```
    *
-   * Add a pattern to the subscription.
+   * You can add a pattern to the subscription.
    *
    * ```js
    * bus.subscribe("MySubscription", "src/subscriber.handler", {
@@ -241,7 +253,7 @@ export class Bus extends Component implements Link.Linkable {
    * });
    * ```
    *
-   * Customize the subscriber function.
+   * To customize the subscriber function:
    *
    * ```js
    * bus.subscribe("MySubscription", {
@@ -253,7 +265,7 @@ export class Bus extends Component implements Link.Linkable {
    * Or pass in the ARN of an existing Lambda function.
    *
    * ```js title="sst.config.ts"
-   * bus.subscribe("arn:aws:lambda:us-east-1:123456789012:function:my-function");
+   * bus.subscribe("MySubscription", "arn:aws:lambda:us-east-1:123456789012:function:my-function");
    * ```
    */
   public subscribe(
@@ -273,7 +285,7 @@ export class Bus extends Component implements Link.Linkable {
   }
 
   /**
-   * Subscribe to an EventBus that was not created in your app.
+   * Subscribe to an EventBus that was not created in your app with a function.
    *
    * @param name The name of the subscription.
    * @param busArn The ARN of the EventBus to subscribe to.
@@ -284,17 +296,17 @@ export class Bus extends Component implements Link.Linkable {
    *
    * For example, let's say you have an existing EventBus with the following ARN.
    *
-   * ```js
+   * ```js title="sst.config.ts"
    * const busArn = "arn:aws:events:us-east-1:123456789012:event-bus/my-bus";
    * ```
    *
    * You can subscribe to it by passing in the ARN.
    *
-   * ```js
+   * ```js title="sst.config.ts"
    * sst.aws.Bus.subscribe("MySubscription", busArn, "src/subscriber.handler");
    * ```
    *
-   * Add a pattern to the subscription.
+   * To add a pattern to the subscription.
    *
    * ```js
    * sst.aws.Bus.subscribe("MySubscription", busArn, "src/subscriber.handler", {
@@ -304,7 +316,7 @@ export class Bus extends Component implements Link.Linkable {
    * });
    * ```
    *
-   * Customize the subscriber function.
+   * Or customize the subscriber function.
    *
    * ```js
    * sst.aws.Bus.subscribe("MySubscription", busArn, {
@@ -358,7 +370,7 @@ export class Bus extends Component implements Link.Linkable {
    * Subscribe to this EventBus with an SQS Queue.
    *
    * @param name The name of the subscription.
-   * @param queue The ARN of the queue or `Queue` component that'll be notified.
+   * @param queue The queue that'll be notified.
    * @param args Configure the subscription.
    *
    * @example
@@ -366,23 +378,29 @@ export class Bus extends Component implements Link.Linkable {
    * For example, let's say you have a queue.
    *
    * ```js title="sst.config.ts"
-   * const queue = sst.aws.Queue("MyQueue");
+   * const queue = new sst.aws.Queue("MyQueue");
    * ```
    *
    * You can subscribe to this bus with it.
    *
    * ```js title="sst.config.ts"
-   * bus.subscribeQueue(queue);
+   * bus.subscribeQueue("MySubscription", queue);
    * ```
    *
-   * Add a filter to the subscription.
+   * You can also add a filter to the subscription.
    *
-   * ```js title="sst.config.ts"
-   * bus.subscribeQueue(queue, {
+   * ```js
+   * bus.subscribeQueue("MySubscription", queue, {
    *   filter: {
    *     price_usd: [{numeric: [">=", 100]}]
    *   }
    * });
+   * ```
+   *
+   * Or pass in the ARN of an existing SQS queue.
+   *
+   * ```js
+   * bus.subscribeQueue("MySubscription", "arn:aws:sqs:us-east-1:123456789012:my-queue");
    * ```
    */
   public subscribeQueue(
@@ -401,36 +419,42 @@ export class Bus extends Component implements Link.Linkable {
   }
 
   /**
-   * Subscribe to an existing EventBus with a previously created SQS Queue.
+   * Subscribe to an existing EventBus with an SQS Queue.
    *
    * @param name The name of the subscription.
    * @param busArn The ARN of the EventBus to subscribe to.
-   * @param queue The ARN of the queue or `Queue` component that'll be notified.
+   * @param queue The queue that'll be notified.
    * @param args Configure the subscription.
    *
    * @example
    *
-   * For example, let's say you have an existing EventBus and SQS Queue with the following ARNs.
+   * For example, let's say you have an existing EventBus and an SQS Queue.
    *
    * ```js title="sst.config.ts"
    * const busArn = "arn:aws:events:us-east-1:123456789012:event-bus/MyBus";
-   * const queueArn = "arn:aws:sqs:us-east-1:123456789012:MyQueue";
+   * const queue = new sst.aws.Queue("MyQueue");
    * ```
    *
    * You can subscribe to the bus with the queue.
    *
    * ```js title="sst.config.ts"
-   * sst.aws.Bus.subscribeQueue(busArn, queueArn);
+   * sst.aws.Bus.subscribeQueue("MySubscription", busArn, queue);
    * ```
    *
    * Add a filter to the subscription.
    *
    * ```js title="sst.config.ts"
-   * sst.aws.Bus.subscribeQueue(busArn, queueArn, {
+   * sst.aws.Bus.subscribeQueue(MySubscription, busArn, queue, {
    *   filter: {
    *     price_usd: [{numeric: [">=", 100]}]
    *   }
    * });
+   * ```
+   *
+   * Or pass in the ARN of an existing SQS queue.
+   *
+   * ```js
+   * sst.aws.Bus.subscribeQueue("MySubscription", busArn, "arn:aws:sqs:us-east-1:123456789012:my-queue");
    * ```
    */
   public static subscribeQueue(
@@ -467,7 +491,7 @@ export class Bus extends Component implements Link.Linkable {
     return {
       properties: {
         name: this.name,
-        arn: this.nodes.bus.arn,
+        arn: this.arn,
       },
       include: [
         permission({

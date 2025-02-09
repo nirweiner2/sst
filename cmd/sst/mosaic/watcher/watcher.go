@@ -17,8 +17,10 @@ type FileChangedEvent struct {
 }
 
 func Start(ctx context.Context, watchPaths []string) error {
-	defer slog.Info("watcher done")
-	slog.Info("starting watcher", "watchPaths", watchPaths)
+	log := slog.Default().With("service", "watcher")
+	defer log.Info("done")
+	log.Info("starting watcher", "watchPaths", watchPaths)
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -44,7 +46,7 @@ func Start(ctx context.Context, watchPaths []string) error {
 						return filepath.SkipDir
 					}
 				}
-				slog.Info("watching", "path", path)
+				log.Info("watching", "path", path)
 				err = watcher.Add(path)
 				if err != nil {
 					return err
@@ -73,10 +75,10 @@ func Start(ctx context.Context, watchPaths []string) error {
 			// }
       
 			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
-				slog.Info("ignoring file event", "path", event.Name, "op", event.Op)
+				log.Info("ignoring file event", "path", event.Name, "op", event.Op)
 				continue
 			}
-			slog.Info("file event", "path", event.Name, "op", event.Op)
+			log.Info("file event", "path", event.Name, "op", event.Op)
 			if time.Since(limiter[event.Name]) > 500*time.Millisecond {
 				limiter[event.Name] = time.Now()
 				bus.Publish(&FileChangedEvent{Path: event.Name})

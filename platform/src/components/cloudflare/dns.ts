@@ -177,18 +177,27 @@ export function dns(args: DnsArgs = {}) {
               proxied: output(proxy),
               type,
               name: record.name,
-              content: type === "CAA" ? undefined : record.value,
-              data:
-                type !== "CAA"
-                  ? undefined
-                  : (() => {
+              ...(type === "CAA"
+                ? {
+                    data: (() => {
                       const parts = record.value.split(" ");
                       return {
                         flags: parts[0],
                         tag: parts[1],
-                        value: parts.slice(2).join(" "),
+                        // remove quotes from value
+                        value: parts.slice(2).join(" ").replaceAll(`"`, ""),
                       };
                     })(),
+                  }
+                : type === "TXT"
+                  ? {
+                      content: record.value.startsWith(`"`)
+                        ? record.value
+                        : `"${record.value}"`,
+                    }
+                  : {
+                      content: record.value,
+                    }),
               ttl: output(proxy).apply((proxy) => (proxy ? 1 : 60)),
               allowOverwrite: args.override,
             },
